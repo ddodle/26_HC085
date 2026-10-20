@@ -1,0 +1,50 @@
+//
+//  MockScanRepository.swift
+//  RoomLogTests
+//
+//  Created by 김도연 on 5/31/26.
+//
+
+import Foundation
+@testable import RoomLog
+
+final class MockScanRepository: ScanRepositoryProtocol {
+
+    // MARK: - Call Tracking
+
+    var uploadScanCallCount = 0
+    var getScanStatusCallCount = 0
+    var getScanPreviewCallCount = 0
+    var cancelScanCallCount = 0
+    var lastUploadProgress: Progress?
+
+    // MARK: - Stub Results
+
+    var uploadScanResult: Result<ScanResult, RepositoryError> = .success(ScanResult(scanId: 1, status: "COMPLETED"))
+    var getScanStatusResult: Result<String, RepositoryError> = .success("COMPLETED")
+    var getScanPreviewResult: Result<String, RepositoryError> = .success("https://example.com/preview.usdz")
+    var cancelScanResult: Result<Void, RepositoryError> = .success(())
+
+    // MARK: - ScanRepositoryProtocol
+
+    func uploadScan(houseId: Int, fileURL: URL, progress: Progress?) async throws(RepositoryError) -> ScanResult {
+        uploadScanCallCount += 1
+        lastUploadProgress = progress
+        return try uploadScanResult.get()
+    }
+
+    func getScanStatus(scanId: Int) async throws(RepositoryError) -> String {
+        getScanStatusCallCount += 1
+        return try getScanStatusResult.get()
+    }
+
+    func getScanPreview(scanId: Int) async throws(RepositoryError) -> String {
+        getScanPreviewCallCount += 1
+        return try getScanPreviewResult.get()
+    }
+
+    func cancelScan(scanId: Int) async throws(RepositoryError) {
+        cancelScanCallCount += 1
+        try cancelScanResult.get()
+    }
+}

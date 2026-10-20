@@ -1,0 +1,29 @@
+# 이 파일을 application-dev.yml로 복사한 뒤 필요한 환경변수를 설정합니다.
+# application-dev.yml과 .env 파일은 Git에서 제외됩니다.
+# .env는 Spring Boot가 자동으로 읽지 않으므로 셸 또는 IDE에서 환경변수를 주입합니다.
+#
+# 공통 설정(application.yml)에 필요한 환경변수:
+# JWT_SECRET: JWT 서명 키(32바이트 이상)
+# AI_API_KEY: AI 서버와 공유하는 인증 키
+# AI_SERVER_URL: AI 서버 주소
+# AI_CALLBACK_BASE_URL: AI 서버에서 접근 가능한 이 서버의 주소
+# KAKAO_API_KEY, GPT_API_KEY, YOUTUBE_API_KEY: 각 서비스 API 키
+
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:mysql://localhost:3306/roomlog}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+
+cloud:
+  r2:
+    account-id: ${R2_ACCOUNT_ID}
+    access-key: ${R2_ACCESS_KEY}
+    secret-key: ${R2_SECRET_KEY}
+    bucket: ${R2_BUCKET}
+    cdn-url: ${R2_CDN_URL}

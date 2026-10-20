@@ -1,0 +1,6 @@
+// 이 파일을 같은 폴더의 Config.xcconfig로 복사한 뒤 실제 값을 입력하세요.
+// Config.xcconfig는 Git에서 제외됩니다.
+
+// xcconfig에서 //는 주석이므로 URL의 :/$()/ 표기를 유지하세요.
+BASE_URL = https:/$()/api.example.com
+KAKAO_NATIVE_APP_KEY = YOUR_KAKAO_NATIVE_APP_KEY

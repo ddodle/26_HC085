@@ -1,0 +1,45 @@
+//
+//  RoomDetailViewPreviews.swift
+//  RoomLog
+//
+//  Created by 김도연 on 5/13/26.
+//
+
+#if DEBUG
+import SwiftUI
+
+private let sampleRoom = RoomDetail(
+    id: 1,
+    name: "거실",
+    moveInDate: nil,
+    moveOutDate: nil,
+    fileURL: nil,
+    createdAt: Date(),
+    latestScan: ScanDetail(scanId: 1, status: "COMPLETED", createdAt: Date())
+)
+
+#Preview("스캔 데이터 없음") {
+    NavigationStack {
+        RoomDetailView(preview: sampleRoom)
+    }
+}
+
+#Preview("에러 상태") {
+    NavigationStack {
+        RoomDetailView(
+            preview: sampleRoom,
+            errorMessage: "네트워크 연결에 실패했습니다"
+        )
+    }
+}
+
+#Preview("USDZ 뷰어") {
+    NavigationStack {
+        RoomDetailView(
+            preview: sampleRoom,
+            localModelURL: URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("preview.usdz")
+        )
+    }
+}
+#endif

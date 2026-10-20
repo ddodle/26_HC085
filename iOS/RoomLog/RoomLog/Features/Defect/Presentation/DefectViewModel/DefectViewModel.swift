@@ -1,0 +1,271 @@
+//
+//  DefectViewModel.swift
+//  RoomLog
+//
+//  Created by 송민교 on 4/22/26.
+//
+
+import Foundation
+
+@Observable
+final class DefectViewModel {
+    // MARK: - Analysis Phase
+    enum AnalysisPhase: Equatable {
+        case loading
+        case polling
+        case completed
+        case failed(String)
+    }
+
+    // MARK: - State
+    private(set) var report: DefectReport?
+    private(set) var phase: AnalysisPhase = .loading
+    private(set) var localModelURL: URL?
+    /// 모델 다운로드 실패 여부. 옛 캐시로 대체하지 않고 화면에 실패 안내를 띄우기 위한 상태
+    private(set) var isModelDownloadFailed = false
+    var errorMessage: String?
+
+    // MARK: - Provider
+    let roomId: Int
+    private let provider: DefectUseCaseProvider
+    private let fileCache: USDZFileCacheProtocol
+
+    // MARK: - Local Analysis Tracking
+    private static let analysisIdPrefix = "pendingAnalysisId_room_"
+
+    private static func savedAnalysisId(for roomId: Int) -> Int? {
+        let value = UserDefaults.standard.integer(forKey: "\(analysisIdPrefix)\(roomId)")
+        return value == 0 ? nil : value
+    }
+
+    private static func saveAnalysisId(_ analysisId: Int, for roomId: Int) {
+        UserDefaults.standard.set(analysisId, forKey: "\(analysisIdPrefix)\(roomId)")
+    }
+
+    private static func clearAnalysisId(for roomId: Int) {
+        UserDefaults.standard.removeObject(forKey: "\(analysisIdPrefix)\(roomId)")
+    }
+
+    private static let analysisCompletedPrefix = "analysisCompleted_room_"
+
+    /// 방 목록 배지 표시용 — 분석이 완료된 적 있는 방인지
+    static func isAnalysisCompleted(for roomId: Int) -> Bool {
+        UserDefaults.standard.bool(forKey: "\(analysisCompletedPrefix)\(roomId)")
+    }
+
+    private static func markAnalysisCompleted(for roomId: Int) {
+        UserDefaults.standard.set(true, forKey: "\(analysisCompletedPrefix)\(roomId)")
+    }
+
+    init(
+        roomId: Int,
+        provider: DefectUseCaseProvider,
+        fileCache: USDZFileCacheProtocol = USDZFileCache.shared
+    ) {
+        self.roomId = roomId
+        self.provider = provider
+        self.fileCache = fileCache
+    }
+
+    // MARK: - Function
+
+    /// 1. 기존 하자 결과 조회 → defects 있으면 바로 표시
+    /// 2. savedAnalysisId 있으면 상태 확인 → polling 재개 or 결과 표시
+    /// 3. 없으면 POST /analyses → 분석 시작
+    /// 모델 파일은 report.imageURL이 정해진 뒤 `downloadModelIfNeeded()`가 캐시 비교 후 받는다.
+    func loadOrAnalyze() async {
+        // 1. 기존 하자 결과 조회 → defects가 있으면 바로 표시
+        if let existingReport = try? await provider.makeGetDefectReportUseCase().execute(roomId: roomId),
+           !existingReport.defects.isEmpty {
+            report = existingReport
+            phase = .completed
+            Self.markAnalysisCompleted(for: roomId)
+            return
+        }
+
+        // 2. 저장된 analysisId가 있으면 상태 확인 (중복 분석 방지)
+        if let savedId = Self.savedAnalysisId(for: roomId) {
+            do {
+                let status = try await provider.makeGetAnalysisStatusUseCase().execute(analysisId: savedId).uppercased()
+                switch status {
+                case "COMPLETED":
+                    // analysisId 유지 — 재진입 시 다시 결과 조회 가능
+                    await fetchReport()
+                    return
+                case "FAILED":
+                    Self.clearAnalysisId(for: roomId)
+                    // FAILED → 새 분석 시작
+                default:
+                    // PENDING → polling 재개
+                    await resumePolling(analysisId: savedId)
+                    return
+                }
+            } catch let error as RepositoryError {
+                if error.serverErrorCode == .analysisNotFound {
+                    Self.clearAnalysisId(for: roomId)
+                } else {
+                    phase = .failed(error.userMessage)
+                    return
+                }
+            } catch {
+                phase = .failed(error.localizedDescription)
+                return
+            }
+        }
+
+        // 2. 새 분석 요청 (or 서버가 기존 완료 분석 반환)
+        await startAnalysis()
+    }
+
+    func fetchReport() async {
+        do {
+            report = try await provider.makeGetDefectReportUseCase().execute(roomId: roomId)
+            phase = .completed
+            Self.markAnalysisCompleted(for: roomId)
+        } catch {
+            errorMessage = error.localizedDescription
+            phase = .failed(error.localizedDescription)
+        }
+    }
+
+    private enum PollConfig {
+        static let intervalSeconds = 7
+        static let maxConsecutiveErrors = 3
+    }
+
+    /// 새 분석 요청 → polling → 완료 시 하자 데이터 로드
+    func startAnalysis() async {
+        guard phase != .polling else { return }
+        phase = .polling
+        preparePollingReport()
+
+        // POST /analyses
+        let analysisId: Int
+        do {
+            let result = try await provider.makeRequestAnalysisUseCase().execute(inRoomId: roomId, outRoomId: nil)
+            analysisId = result.analysisId
+            Self.saveAnalysisId(analysisId, for: roomId)
+
+            let status = result.status.uppercased()
+            if status == "COMPLETED" {
+                await fetchReport()
+                return
+            }
+            if status == "FAILED" {
+                Self.clearAnalysisId(for: roomId)
+                phase = .failed("서버에서 분석에 실패했습니다")
+                return
+            }
+        } catch {
+            phase = .failed("분석 요청 실패: \(error.localizedDescription)")
+            return
+        }
+
+        await pollUntilDone(analysisId: analysisId)
+    }
+
+    /// 저장된 analysisId로 polling 재개
+    private func resumePolling(analysisId: Int) async {
+        guard phase != .polling else { return }
+        phase = .polling
+        preparePollingReport()
+        await pollUntilDone(analysisId: analysisId)
+    }
+
+    /// polling 시작 전 report 준비 (기존 file_url 유지)
+    private func preparePollingReport() {
+        let existingImageURL = report?.imageURL
+        let existingRoom = report?.room
+        report = DefectReport(
+            room: existingRoom ?? DefectRoomData(id: roomId, title: "", date: Date(), thumbnailURL: nil),
+            imageURL: existingImageURL,
+            defectCount: 0,
+            minRepairCost: 0,
+            repairArea: 0,
+            defects: []
+        )
+    }
+
+    /// 상태 polling → COMPLETED까지 대기
+    private func pollUntilDone(analysisId: Int) async {
+        // file_url이 없으면 한 번 조회 시도 (3D 이미지 먼저 표시)
+        if report?.imageURL == nil {
+            if let updatedReport = try? await provider.makeGetDefectReportUseCase().execute(roomId: roomId),
+               updatedReport.imageURL != nil {
+                report = DefectReport(
+                    room: updatedReport.room,
+                    imageURL: updatedReport.imageURL,
+                    defectCount: 0,
+                    minRepairCost: 0,
+                    repairArea: 0,
+                    defects: []
+                )
+            }
+        }
+
+        // 상태 polling (GET /analyses/{id}/status)
+        var consecutiveErrors = 0
+        while !Task.isCancelled {
+            do {
+                let status = try await provider.makeGetAnalysisStatusUseCase().execute(analysisId: analysisId).uppercased()
+                consecutiveErrors = 0
+
+                if status == "COMPLETED" {
+                    break
+                } else if status == "FAILED" {
+                    Self.clearAnalysisId(for: roomId)
+                    phase = .failed("서버에서 분석에 실패했습니다")
+                    return
+                }
+            } catch {
+                if Task.isCancelled {
+                    phase = .loading
+                    return
+                }
+                consecutiveErrors += 1
+                if consecutiveErrors >= PollConfig.maxConsecutiveErrors {
+                    phase = .failed("상태 조회 실패: \(error.localizedDescription)")
+                    return
+                }
+            }
+
+            try? await Task.sleep(for: .seconds(PollConfig.intervalSeconds))
+        }
+
+        if Task.isCancelled {
+            // 뷰가 사라져 취소된 경우 재진입 시 polling을 재개할 수 있도록 되돌림 (analysisId는 유지)
+            phase = .loading
+            return
+        }
+
+        // 완료 → 하자 데이터 로드
+        await fetchReport()
+    }
+
+    /// file_url이 있으면 USDZ 파일 다운로드 → localModelURL에 저장.
+    /// USDZFileCache.download가 원격 URL이 이전과 같으면 캐시를 재사용하고, 바뀌었으면 다시 받으므로
+    /// 재분석으로 imageURL이 갱신된 경우에도 오래된 파일을 계속 쓰지 않는다.
+    func downloadModelIfNeeded() async {
+        guard let urlString = report?.imageURL,
+              let remoteURL = URL(string: urlString) else { return }
+
+        isModelDownloadFailed = false
+        do {
+            localModelURL = try await fileCache.download(from: remoteURL, roomId: roomId)
+        } catch {
+            // 바뀐 모델을 못 받았을 때 옛 캐시를 보여주면 새 하자 좌표를 옛 메시 위에 그리게 되므로 실패로 노출한다
+            localModelURL = nil
+            isModelDownloadFailed = true
+            print("[Defect] Model download failed: \(error)")
+        }
+    }
+
+    #if DEBUG
+    static func preview(phase: AnalysisPhase, report: DefectReport?, provider: DefectUseCaseProvider) -> DefectViewModel {
+        let vm = DefectViewModel(roomId: 1, provider: provider)
+        vm.phase = phase
+        vm.report = report
+        return vm
+    }
+    #endif
+}

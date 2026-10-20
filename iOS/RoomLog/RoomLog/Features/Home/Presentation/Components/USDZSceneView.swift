@@ -1,0 +1,698 @@
+//
+//  USDZSceneView.swift
+//  RoomLog
+//
+//  Created by 김도연 on 5/12/26.
+//
+
+import SwiftUI
+import SceneKit
+
+// MARK: - Camera Direction
+
+enum CameraDirection: CaseIterable {
+    case front, back, left, right, top, bottom
+
+    var icon: String {
+        switch self {
+        case .front:  return "arrow.up"
+        case .back:   return "arrow.down"
+        case .left:   return "arrow.left"
+        case .right:  return "arrow.right"
+        case .top:    return "arrow.up.circle"
+        case .bottom: return "arrow.down.circle"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .front:  return "앞"
+        case .back:   return "뒤"
+        case .left:   return "좌"
+        case .right:  return "우"
+        case .top:    return "천장"
+        case .bottom: return "바닥"
+        }
+    }
+}
+
+// MARK: - Scene Memory Cache
+
+/// 파싱된 SCNScene을 메모리에 캐시해 재진입 시 USDZ 재파싱을 피한다.
+/// 파일이 교체되면 수정 시각이 바뀌어 키가 달라지므로 자동으로 새로 파싱된다.
+final class USDZSceneCache {
+    static let shared = USDZSceneCache()
+
+    private let cache = NSCache<NSString, SCNScene>()
+
+    private init() {
+        // 방 스캔 씬은 개당 수십~수백 MB라 최근 것만 유지 (비교 화면이 동시에 2개 사용)
+        cache.countLimit = 3
+    }
+
+    private func key(for url: URL) -> NSString {
+        let modified = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        return "\(url.path)#\(modified?.timeIntervalSince1970 ?? 0)" as NSString
+    }
+
+    func scene(for url: URL) -> SCNScene? {
+        cache.object(forKey: key(for: url))
+    }
+
+    func store(_ scene: SCNScene, for url: URL) {
+        cache.setObject(scene, forKey: key(for: url))
+    }
+}
+
+// MARK: - Scene Preparation
+
+/// 백그라운드 로드 태스크에서 호출되므로 앱 기본 격리(MainActor)에서 뺀다.
+nonisolated enum USDZScenePreparation {
+
+    /// 로드 직후 마스터 씬에 한 번만 적용한다. 복제된 뷰별 씬은 머티리얼을 공유하므로 그대로 반영된다.
+    ///
+    /// 서버 USDZ는 모든 메시가 `doubleSided = 1`로 내보내져 방 바깥 벽이 시야를 막는다.
+    /// 법선은 방 안쪽을 향하므로 뒷면 컬링을 켜면 PLY 때처럼 바깥에서도 내부가 보인다.
+    static func prepare(_ scene: SCNScene) {
+        scene.rootNode.enumerateHierarchy { node, _ in
+            node.geometry?.materials.forEach { $0.isDoubleSided = false }
+        }
+    }
+}
+
+// MARK: - USDZSceneView
+
+struct USDZSceneView: UIViewRepresentable {
+    let fileURL: URL
+    var defects: [DefectReportDetail] = []
+    var cameraDirection: Binding<CameraDirection?>?
+    var resetCamera: Binding<Bool>?
+
+    // MARK: - Coordinator
+
+    class Coordinator: NSObject {
+        var defects: [DefectReportDetail] = []
+        weak var scnView: SCNView?
+        var lastAppliedDirection: CameraDirection?
+        /// 현재 화면에 적용된 씬의 원본 파일 URL — fileURL이 바뀌면 씬을 다시 로드하기 위한 기준
+        var loadedFileURL: URL?
+        var loadingFileURL: URL?
+        var loadTask: Task<Void, Never>?
+        /// 파일을 읽지 못했을 때 띄운 안내 라벨. 다음 로드가 시작되거나 씬이 적용되면 제거한다
+        var failureLabel: UILabel?
+        /// 로드에 실패한 URL. 같은 URL은 뷰가 갱신돼도 다시 시도하지 않는다 (URL이 바뀌거나 뷰가 재생성되면 재시도)
+        var failedFileURL: URL?
+
+        /// Handles a tap on the SceneKit view and, if a defect overlay was tapped, animates the camera to that defect's center.
+        /// - Parameters:
+        ///   - gesture: The tap gesture recognizer whose touch location is hit-tested against the SCNView to locate defect nodes.
+        @objc func handleTap(_ gesture: UITapGestureRecognizer) {
+            guard let scnView = gesture.view as? SCNView else { return }
+            let location = gesture.location(in: scnView)
+
+            let hitResults = scnView.hitTest(location, options: [
+                .searchMode: NSNumber(value: SCNHitTestSearchMode.all.rawValue)
+            ])
+
+            for hit in hitResults {
+                if let defectID = findDefectID(from: hit.node),
+                   let defect = defects.first(where: { $0.id == defectID }) {
+                    animateCameraToDefect(defect, in: scnView)
+                    return
+                }
+            }
+        }
+
+        /// Finds a defect identifier encoded in a node's name or any of its ancestor nodes.
+        /// - Parameter node: The starting `SCNNode` to inspect; the search moves upward through `parent` links.
+        /// - Returns: The integer parsed from a name matching the pattern `"defect_<id>"`, or `nil` if no matching node is found.
+        private func findDefectID(from node: SCNNode) -> Int? {
+            var current: SCNNode? = node
+            while let n = current {
+                if let name = n.name, name.hasPrefix("defect_"),
+                   let id = Int(name.dropFirst("defect_".count)) {
+                    return id
+                }
+                current = n.parent
+            }
+            return nil
+        }
+
+        /// Animates the scene camera to frame and look at the specified defect region.
+        /// 
+        /// If `defect.region3d` is empty or `scnView.pointOfView` is missing, the function returns without changes.
+        /// - Parameters:
+        ///   - defect: The defect whose 3D region will be used to compute the camera target.
+        ///   - scnView: The SceneKit view containing the camera to animate.
+
+        func animateCameraToDefect(_ defect: DefectReportDetail, in scnView: SCNView) {
+            let points = defect.region3d
+            guard !points.isEmpty, let cameraNode = scnView.pointOfView else { return }
+
+            let count = Float(points.count)
+            let cx = points.reduce(Float(0)) { $0 + $1.x } / count
+            let cy = points.reduce(Float(0)) { $0 + $1.y } / count
+            let cz = points.reduce(Float(0)) { $0 + $1.z } / count
+            let center = SCNVector3(cx, cy, cz)
+
+            let offset = defectCameraOffset(for: points, center: center, cameraNode: cameraNode)
+            let target = SCNVector3(center.x + offset.x, center.y + offset.y, center.z + offset.z)
+
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.8
+            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            cameraNode.position = target
+            cameraNode.look(at: center)
+            SCNTransaction.commit()
+        }
+
+        /// Computes a camera offset vector positioned at a fixed distance from the defect region center, oriented along the region's estimated face normal when available or toward the current camera otherwise.
+        /// - Parameters:
+        ///   - points: 3D points defining the defect region; the first three points are used to estimate a face normal.
+        ///   - center: Centroid of the defect region.
+        ///   - cameraNode: Current camera node used to choose the normal direction or as fallback orientation.
+        /// - Returns: An `SCNVector3` whose length is approximately 3.0, pointing from the region center toward the camera-facing side (or directly toward the camera if a reliable normal cannot be computed).
+        private func defectCameraOffset(
+            for points: [DefectPoint3D],
+            center: SCNVector3,
+            cameraNode: SCNNode
+        ) -> SCNVector3 {
+            let distance: Float = 3.0
+
+            if points.count >= 3 {
+                let v0 = SCNVector3(points[0].x, points[0].y, points[0].z)
+                let v1 = SCNVector3(points[1].x, points[1].y, points[1].z)
+                let v2 = SCNVector3(points[2].x, points[2].y, points[2].z)
+
+                let e1x = v1.x - v0.x, e1y = v1.y - v0.y, e1z = v1.z - v0.z
+                let e2x = v2.x - v0.x, e2y = v2.y - v0.y, e2z = v2.z - v0.z
+                let nx = e1y * e2z - e1z * e2y
+                let ny = e1z * e2x - e1x * e2z
+                let nz = e1x * e2y - e1y * e2x
+                let len = sqrt(nx * nx + ny * ny + nz * nz)
+
+                if len > 1e-4 {
+                    var nnx = nx / len, nny = ny / len, nnz = nz / len
+                    let toCamX = cameraNode.position.x - center.x
+                    let toCamY = cameraNode.position.y - center.y
+                    let toCamZ = cameraNode.position.z - center.z
+                    let dot = nnx * toCamX + nny * toCamY + nnz * toCamZ
+                    if dot < 0 { nnx = -nnx; nny = -nny; nnz = -nnz }
+                    return SCNVector3(nnx * distance, nny * distance, nnz * distance)
+                }
+            }
+
+            let dx = cameraNode.position.x - center.x
+            let dy = cameraNode.position.y - center.y
+            let dz = cameraNode.position.z - center.z
+            let dirLen = sqrt(dx * dx + dy * dy + dz * dz)
+            guard dirLen > 0 else { return SCNVector3(0, 0, distance) }
+            let scale = distance / dirLen
+            return SCNVector3(dx * scale, dy * scale, dz * scale)
+        }
+
+        /// Moves the scene's camera to a preset viewpoint for the specified direction, animating the transition.
+        /// - Parameters:
+        ///   - direction: The target `CameraDirection` (front/back/left/right/top/bottom) to move the camera toward.
+        ///   - scnView: The `SCNView` whose scene and `pointOfView` camera will be repositioned. If the scene or camera is missing, the function has no effect.
+        /// - Note: The camera is positioned relative to the scene's root-node bounding box center and the transition is animated (0.6s, ease in/out).
+
+        func moveCamera(direction: CameraDirection, in scnView: SCNView) {
+            guard let scene = scnView.scene,
+                  let cameraNode = scnView.pointOfView else { return }
+
+            let (minBound, maxBound) = scene.rootNode.boundingBox
+            let centerX = (minBound.x + maxBound.x) / 2
+            let centerY = (minBound.y + maxBound.y) / 2
+            let centerZ = (minBound.z + maxBound.z) / 2
+
+            let sizeX = maxBound.x - minBound.x
+            let sizeY = maxBound.y - minBound.y
+            let sizeZ = maxBound.z - minBound.z
+            let maxSize = max(sizeX, max(sizeY, sizeZ))
+            let dist = maxSize * 1.2
+
+            // 회전은 look(at:)이 아니라 방향별 오일러 각으로 직접 준다.
+            // 정확히 뒤에서 look(at:)을 부르면 기본 전방(-Z)과 정반대라 회전이 정의되지 않아
+            // SceneKit이 영 쿼터니언을 돌려주고 카메라가 방 반대쪽을 보게 된다.
+            let position: SCNVector3
+            let eulerAngles: SCNVector3
+            let halfPi = Float.pi / 2
+            switch direction {
+            case .front:
+                position = SCNVector3(centerX, centerY, centerZ + dist)
+                eulerAngles = SCNVector3(0, 0, 0)
+            case .back:
+                position = SCNVector3(centerX, centerY, centerZ - dist)
+                eulerAngles = SCNVector3(0, Float.pi, 0)
+            case .left:
+                position = SCNVector3(centerX - dist, centerY, centerZ)
+                eulerAngles = SCNVector3(0, -halfPi, 0)
+            case .right:
+                position = SCNVector3(centerX + dist, centerY, centerZ)
+                eulerAngles = SCNVector3(0, halfPi, 0)
+            case .top:
+                position = SCNVector3(centerX, centerY + dist, centerZ)
+                eulerAngles = SCNVector3(-halfPi, 0, 0)
+            case .bottom:
+                position = SCNVector3(centerX, centerY - dist, centerZ)
+                eulerAngles = SCNVector3(halfPi, 0, 0)
+            }
+
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.6
+            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            cameraNode.position = position
+            cameraNode.eulerAngles = eulerAngles
+            SCNTransaction.commit()
+        }
+
+        /// Reset the scene camera to a default viewpoint that frames the scene's root node.
+        /// 
+        /// The camera is moved to a position directly above the scene center at a distance equal to 1.5 × the scene's maximum axis size, the camera's orientation is reset (zeroed Euler angles), and the change is animated with a 0.6s ease-in-out transition. If the view has no scene or pointOfView, the call does nothing.
+        /// - Parameter scnView: The `SCNView` whose pointOfView (camera) will be reset.
+
+        func resetToDefaultCamera(in scnView: SCNView) {
+            guard let scene = scnView.scene,
+                  let cameraNode = scnView.pointOfView else { return }
+
+            let (minBound, maxBound) = scene.rootNode.boundingBox
+            let centerX = (minBound.x + maxBound.x) / 2
+            let centerY = (minBound.y + maxBound.y) / 2
+            let centerZ = (minBound.z + maxBound.z) / 2
+
+            let sizeX = maxBound.x - minBound.x
+            let sizeY = maxBound.y - minBound.y
+            let sizeZ = maxBound.z - minBound.z
+            let maxSize = max(sizeX, max(sizeY, sizeZ))
+            let dist = maxSize * 1.5
+
+            let position = SCNVector3(centerX, centerY, centerZ + dist)
+
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.6
+            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            cameraNode.position = position
+            cameraNode.eulerAngles = SCNVector3(0, 0, 0)
+            SCNTransaction.commit()
+        }
+    }
+
+    /// Creates a new coordinator to manage SceneKit interactions and runtime state.
+    /// - Returns: A `Coordinator` instance responsible for gesture handling, defect interaction, and camera control.
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    /// Creates and configures an `SCNView` for SwiftUI integration, attaches a tap gesture that forwards taps to the coordinator, loads the scene from `fileURL` and applies defect overlays, and wires the coordinator's runtime state.
+    /// - Returns: A configured `SCNView` ready for display and interaction.
+    func makeUIView(context: Context) -> SCNView {
+        let scnView = SCNView()
+        scnView.backgroundColor = .systemBackground
+        scnView.allowsCameraControl = true
+        scnView.autoenablesDefaultLighting = true
+
+        let tap = UITapGestureRecognizer(
+            target: context.coordinator,
+            action: #selector(Coordinator.handleTap(_:))
+        )
+        scnView.addGestureRecognizer(tap)
+
+        context.coordinator.defects = defects
+        context.coordinator.scnView = scnView
+        applySceneIfNeeded(to: scnView, coordinator: context.coordinator)
+
+        return scnView
+    }
+
+    /// Updates the provided `SCNView` with the loaded scene and defect overlays, and responds to camera control bindings (move direction or reset).
+    /// - Parameters:
+    ///   - uiView: The `SCNView` to update; the function will load a scene if needed and refresh defect overlay nodes.
+    ///   - context: The SwiftUI `Context` containing the coordinator used to perform camera animations and maintain coordinator state.
+    /// - Note: This method may trigger camera animations via the coordinator and will clear `resetCamera` / `cameraDirection` bindings after applying their effects.
+    func updateUIView(_ uiView: SCNView, context: Context) {
+        context.coordinator.defects = defects
+
+        // fileURL이 바뀌었으면(예: 비교 화면 이전/이후 토글) 씬을 새로 로드해야 한다
+        if let scene = uiView.scene, context.coordinator.loadedFileURL == fileURL {
+            updateDefectOverlays(in: scene, defects: defects)
+        } else {
+            applySceneIfNeeded(to: uiView, coordinator: context.coordinator)
+        }
+
+        // 카메라 초기화 처리
+        if let binding = resetCamera, binding.wrappedValue {
+            context.coordinator.resetToDefaultCamera(in: uiView)
+            context.coordinator.lastAppliedDirection = nil
+            DispatchQueue.main.async { binding.wrappedValue = false }
+        }
+
+        // 카메라 방향 버튼 처리
+        if let binding = cameraDirection,
+           let direction = binding.wrappedValue,
+           direction != context.coordinator.lastAppliedDirection {
+            context.coordinator.lastAppliedDirection = direction
+            context.coordinator.moveCamera(direction: direction, in: uiView)
+            DispatchQueue.main.async { binding.wrappedValue = nil }
+        }
+        if cameraDirection?.wrappedValue == nil {
+            context.coordinator.lastAppliedDirection = nil
+        }
+    }
+
+    /// 메모리 캐시에 씬이 있으면 즉시 적용하고, 없으면 백그라운드에서 USDZ를 로드한 뒤 적용한다.
+    /// USDZ 로드(`SCNScene(url:)`)는 파일이 크면 수 초가 걸리므로 메인 스레드에서 실행하지 않는다.
+    private func applySceneIfNeeded(to scnView: SCNView, coordinator: Coordinator) {
+        if let master = USDZSceneCache.shared.scene(for: fileURL) {
+            coordinator.loadTask?.cancel()
+            coordinator.loadingFileURL = nil
+            apply(master: master, for: fileURL, to: scnView, coordinator: coordinator)
+            return
+        }
+
+        // 같은 URL을 이미 로드 중이거나 방금 실패했으면 그대로 두고, 다른 URL이면 기존 작업을 취소하고 새로 시작
+        guard coordinator.loadingFileURL != fileURL, coordinator.failedFileURL != fileURL else { return }
+        coordinator.loadTask?.cancel()
+        coordinator.loadingFileURL = fileURL
+        coordinator.failedFileURL = nil
+        coordinator.failureLabel?.removeFromSuperview()
+        coordinator.failureLabel = nil
+
+        let spinner = UIActivityIndicatorView(style: .medium)
+        spinner.startAnimating()
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        scnView.addSubview(spinner)
+        NSLayoutConstraint.activate([
+            spinner.centerXAnchor.constraint(equalTo: scnView.centerXAnchor),
+            spinner.centerYAnchor.constraint(equalTo: scnView.centerYAnchor)
+        ])
+
+        let url = fileURL
+        coordinator.loadTask = Task.detached(priority: .userInitiated) {
+            guard !Task.isCancelled else { return }
+            // USDZ는 SceneKit 네이티브 포맷이라 Model I/O 변환 없이 직접 읽는다 (USD 머티리얼·텍스처 보존)
+            let loaded = try? SCNScene(url: url, options: nil)
+            if let loaded { USDZScenePreparation.prepare(loaded) }
+            await MainActor.run {
+                spinner.removeFromSuperview()
+                // 로드 중 다른 URL로 바뀌었거나 뷰가 사라졌으면 적용하지 않는다 (성공 시 캐시에는 남는다)
+                let isCurrent = coordinator.loadingFileURL == url
+                guard let master = loaded else {
+                    // 손상되었거나 읽을 수 없는 파일: 로딩 상태를 풀고 실패 안내를 표시한다.
+                    // 이전 URL의 씬이 남아 있으면 다른 방 모델이 현재 결과처럼 보이므로 함께 비운다
+                    if isCurrent {
+                        coordinator.loadingFileURL = nil
+                        coordinator.failedFileURL = url
+                        coordinator.loadedFileURL = nil
+                        if let liveView = coordinator.scnView {
+                            liveView.scene = nil
+                            showLoadFailure(in: liveView, coordinator: coordinator)
+                        }
+                    }
+                    return
+                }
+                USDZSceneCache.shared.store(master, for: url)
+                guard isCurrent, let liveView = coordinator.scnView else { return }
+                coordinator.loadingFileURL = nil
+                apply(master: master, for: url, to: liveView, coordinator: coordinator)
+            }
+        }
+    }
+
+    /// 캐시된 마스터 씬을 직접 표시하지 않고 노드 트리를 복제해 뷰별 씬을 만든다.
+    /// 지오메트리는 공유되어 복제 비용이 적고, 오버레이·카메라 조작이 같은 파일을 쓰는 다른 뷰와 섞이지 않는다.
+    private func apply(master: SCNScene, for url: URL, to scnView: SCNView, coordinator: Coordinator) {
+        coordinator.failureLabel?.removeFromSuperview()
+        coordinator.failureLabel = nil
+        coordinator.failedFileURL = nil
+        let scene = SCNScene()
+        for child in master.rootNode.childNodes {
+            scene.rootNode.addChildNode(child.clone())
+        }
+        updateDefectOverlays(in: scene, defects: coordinator.defects)
+        scnView.scene = scene
+        coordinator.loadedFileURL = url
+    }
+
+    /// 파일을 읽지 못했을 때 뷰 중앙에 안내 문구를 표시한다.
+    private func showLoadFailure(in scnView: SCNView, coordinator: Coordinator) {
+        let label = UILabel()
+        label.text = "3D 모델을 불러오지 못했습니다"
+        label.font = .preferredFont(forTextStyle: .footnote)
+        label.textColor = .secondaryLabel
+        label.textAlignment = .center
+        label.numberOfLines = 0
+        label.translatesAutoresizingMaskIntoConstraints = false
+        scnView.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: scnView.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: scnView.centerYAnchor),
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: scnView.leadingAnchor, constant: 16),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: scnView.trailingAnchor, constant: -16)
+        ])
+        coordinator.failureLabel = label
+    }
+
+    static func dismantleUIView(_ uiView: SCNView, coordinator: Coordinator) {
+        coordinator.loadTask?.cancel()
+    }
+
+    // MARK: - Defect Overlays
+
+    private func updateDefectOverlays(in scene: SCNScene, defects: [DefectReportDetail]) {
+        // 컨테이너 이름에 하자 id 구성을 인코딩해두고, 같은 구성이면 재생성을 생략한다
+        // (오버레이 생성은 하자마다 지오메트리 + 라벨 텍스처 래스터라이즈를 수반하는 비싼 작업)
+        let ids = defects.filter { !$0.region3d.isEmpty }.map(\.id).sorted()
+        let signature = "defectOverlay|\(ids.map(String.init).joined(separator: ","))"
+
+        if let existing = scene.rootNode.childNodes.first(where: { $0.name?.hasPrefix("defectOverlay") == true }) {
+            if existing.name == signature { return }
+            existing.removeFromParentNode()
+        }
+        guard !ids.isEmpty else { return }
+        addDefectOverlays(to: scene, defects: defects, containerName: signature)
+    }
+
+    /// Adds visual overlays for each defect to the given scene.
+    /// 
+    /// Creates a top-level container node named "defectOverlay" and, for every defect that has a non-empty `region3d`,
+    /// adds a child group node named "defect_<id>" containing:
+    /// - a filled polygon region node representing the defect area, and
+    /// - a marker node positioned at the region centroid showing the defect type and area.
+    /// Defects with empty `region3d` are skipped.
+    /// - Parameters:
+    ///   - scene: The SceneKit scene to which defect overlay nodes will be added.
+    ///   - defects: An array of defect details; each defect's `region3d` provides the polygon vertices and is used to build the overlay.
+    private func addDefectOverlays(to scene: SCNScene, defects: [DefectReportDetail], containerName: String) {
+        let container = SCNNode()
+        container.name = containerName
+
+        for defect in defects {
+            guard !defect.region3d.isEmpty else { continue }
+            let points = defect.region3d
+
+            let group = SCNNode()
+            group.name = "defect_\(defect.id)"
+
+            let regionNode = createPolygonNode(points: points)
+            regionNode.renderingOrder = 1
+            group.addChildNode(regionNode)
+
+            let center = centroid(of: points)
+            let markerNode = createMarkerNode(
+                at: center,
+                title: defect.type.displayName,
+                area: defect.defectArea
+            )
+            markerNode.renderingOrder = 10
+            group.addChildNode(markerNode)
+
+            container.addChildNode(group)
+        }
+
+        scene.rootNode.addChildNode(container)
+    }
+
+    /// Creates an SCNNode representing a filled polygon defined by the given 3D points, rendered with a translucent blue material.
+    /// - Parameters:
+    ///   - points: Ordered vertices of the polygon in 3D space; must contain at least three points to form a polygon.
+    /// - Returns: An `SCNNode` whose geometry is the filled polygon with a semi-transparent blue material.
+
+    private func createPolygonNode(points: [DefectPoint3D]) -> SCNNode {
+        let vertices = points.map { SCNVector3($0.x, $0.y, $0.z) }
+
+        var indices: [Int32] = []
+        for i in 1..<(vertices.count - 1) {
+            indices.append(0)
+            indices.append(Int32(i))
+            indices.append(Int32(i + 1))
+            indices.append(0)
+            indices.append(Int32(i + 1))
+            indices.append(Int32(i))
+        }
+
+        let vertexSource = SCNGeometrySource(vertices: vertices)
+        let indexData = Data(bytes: indices, count: indices.count * MemoryLayout<Int32>.size)
+        let element = SCNGeometryElement(
+            data: indexData,
+            primitiveType: .triangles,
+            primitiveCount: indices.count / 3,
+            bytesPerIndex: MemoryLayout<Int32>.size
+        )
+
+        let geometry = SCNGeometry(sources: [vertexSource], elements: [element])
+
+        let material = SCNMaterial()
+        material.diffuse.contents = UIColor.systemBlue.withAlphaComponent(0.15)
+        material.emission.contents = UIColor.systemBlue.withAlphaComponent(0.08)
+        material.isDoubleSided = true
+        material.writesToDepthBuffer = false
+        material.readsFromDepthBuffer = false
+        geometry.materials = [material]
+
+        return SCNNode(geometry: geometry)
+    }
+
+    /// Creates a marker node with a billboarded image label showing the given title and formatted area at the specified 3D position.
+    /// - Parameters:
+    ///   - position: World-space position where the marker will be placed.
+    ///   - title: Title text displayed on the label.
+    ///   - area: Area in square centimeters; rendered as a string formatted to two decimal places (e.g. "12.34 cm²").
+    /// - Returns: An `SCNNode` positioned at `position` containing a textured plane that faces the camera and displays the title and area.
+
+    private func createMarkerNode(at position: SCNVector3, title: String, area: Double) -> SCNNode {
+        let node = SCNNode()
+        node.position = position
+
+        let areaText = String(format: "%.2f cm²", area)
+        let labelImage = renderLabel(title: title, subtitle: areaText)
+        let aspect = labelImage.size.width / labelImage.size.height
+        let planeHeight: CGFloat = 0.8
+        let planeWidth = planeHeight * aspect
+        let plane = SCNPlane(width: planeWidth, height: planeHeight)
+        let planeMat = SCNMaterial()
+        planeMat.diffuse.contents = labelImage
+        planeMat.emission.contents = labelImage
+        planeMat.isDoubleSided = true
+        planeMat.writesToDepthBuffer = false
+        planeMat.readsFromDepthBuffer = false
+        plane.materials = [planeMat]
+
+        let labelNode = SCNNode(geometry: plane)
+        labelNode.position = SCNVector3(0, 0.5, 0)
+
+        let billboard = SCNBillboardConstraint()
+        billboard.freeAxes = .all
+        node.constraints = [billboard]
+
+        node.addChildNode(labelNode)
+
+        return node
+    }
+
+    /// Renders a rounded label image combining a title and subtitle for use as a 3D marker texture.
+    /// - Parameters:
+    ///   - title: The primary text displayed prominently at the top of the label.
+    ///   - subtitle: The secondary text displayed below the title with reduced emphasis.
+    /// - Returns: A `UIImage` sized to fit the text that contains a semi-transparent black rounded background with the title (bold, white) and subtitle (semibold, white at reduced alpha) drawn centered vertically with padding.
+
+    private func renderLabel(title: String, subtitle: String) -> UIImage {
+        let titleFont = UIFont.systemFont(ofSize: 36, weight: .bold)
+        let subtitleFont = UIFont.systemFont(ofSize: 28, weight: .semibold)
+
+        let titleAttrs: [NSAttributedString.Key: Any] = [
+            .font: titleFont,
+            .foregroundColor: UIColor.white
+        ]
+        let subtitleAttrs: [NSAttributedString.Key: Any] = [
+            .font: subtitleFont,
+            .foregroundColor: UIColor.white.withAlphaComponent(0.85)
+        ]
+
+        let titleSize = (title as NSString).size(withAttributes: titleAttrs)
+        let subtitleSize = (subtitle as NSString).size(withAttributes: subtitleAttrs)
+
+        let padding: CGFloat = 24
+        let lineSpacing: CGFloat = 8
+        let contentWidth = max(titleSize.width, subtitleSize.width)
+        let contentHeight = titleSize.height + lineSpacing + subtitleSize.height
+        let size = CGSize(width: contentWidth + padding * 2, height: contentHeight + padding * 1.5)
+
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { _ in
+            let rect = CGRect(origin: .zero, size: size)
+            let path = UIBezierPath(roundedRect: rect, cornerRadius: 20)
+            UIColor.black.withAlphaComponent(0.75).setFill()
+            path.fill()
+
+            let titleOrigin = CGPoint(x: padding, y: padding * 0.6)
+            (title as NSString).draw(at: titleOrigin, withAttributes: titleAttrs)
+
+            let subtitleOrigin = CGPoint(x: padding, y: padding * 0.6 + titleSize.height + lineSpacing)
+            (subtitle as NSString).draw(at: subtitleOrigin, withAttributes: subtitleAttrs)
+        }
+    }
+
+    /// Computes the centroid (arithmetic mean) of the given 3D defect points.
+    /// - Parameter points: Array of `DefectPoint3D` whose coordinates will be averaged; must contain at least one element.
+    /// - Returns: An `SCNVector3` representing the average x, y and z coordinates of the input points.
+    private func centroid(of points: [DefectPoint3D]) -> SCNVector3 {
+        let n = Float(points.count)
+        let x = points.reduce(0 as Float) { $0 + $1.x } / n
+        let y = points.reduce(0 as Float) { $0 + $1.y } / n
+        let z = points.reduce(0 as Float) { $0 + $1.z } / n
+        return SCNVector3(x, y, z)
+    }
+}
+
+// MARK: - Camera Direction Bar
+
+struct CameraDirectionBar: View {
+    @Binding var direction: CameraDirection?
+    @Binding var resetCamera: Bool
+    @State private var selected: CameraDirection?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(CameraDirection.allCases, id: \.label) { dir in
+                Button {
+                    selected = dir
+                    direction = dir
+                } label: {
+                    VStack(spacing: 2) {
+                        Image(systemName: dir.icon)
+                            .font(.system(size: 14, weight: .semibold))
+                        Text(dir.label)
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundStyle(selected == dir ? .black : .white)
+                    .frame(maxWidth: 44, minHeight: 44)
+                    .background(
+                        selected == dir
+                            ? AnyShapeStyle(Color.white)
+                            : AnyShapeStyle(.clear),
+                        in: RoundedRectangle(cornerRadius: 8)
+                    )
+                }
+            }
+
+            Divider()
+                .frame(height: 28)
+                .background(.white.opacity(0.3))
+
+            Button {
+                selected = nil
+                resetCamera = true
+            } label: {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: 44, minHeight: 44)
+            }
+            .accessibilityLabel("시점 초기화")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+    }
+}

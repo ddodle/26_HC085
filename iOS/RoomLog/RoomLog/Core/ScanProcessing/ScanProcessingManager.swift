@@ -1,0 +1,428 @@
+//
+//  ScanProcessingManager.swift
+//  RoomLog
+//
+//  Created by 김도연 on 5/12/26.
+//
+
+import Foundation
+import SwiftUI
+import ZIPFoundation
+
+@MainActor
+@Observable
+final class ScanProcessingManager {
+
+    // MARK: - State
+
+    private(set) var activeScan: ActiveScan?
+
+    // MARK: - Dependencies
+
+    private var scanRepository: ScanRepositoryProtocol?
+    private let fileCache: USDZFileCacheProtocol
+    private let pollConfig: PollConfig
+    private let artifactStore: ScanArtifactStore
+    private let backgroundContinuation: ScanBackgroundContinuing
+    private let completionNotifier: ScanCompletionNotifying
+    private var processingTask: Task<Void, Never>?
+
+    // MARK: - Setup
+
+    /// - Parameters:
+    ///   - backgroundContinuation: nil이면 앱 공용 인스턴스.
+    ///   - completionNotifier: nil이면 기본 구현.
+    ///   MainActor 격리 타입은 기본 인자로 둘 수 없어 본문에서 채운다
+    init(
+        pollConfig: PollConfig = PollConfig(),
+        artifactStore: ScanArtifactStore = ScanArtifactStore(),
+        fileCache: USDZFileCacheProtocol = USDZFileCache.shared,
+        backgroundContinuation: ScanBackgroundContinuing? = nil,
+        completionNotifier: ScanCompletionNotifying? = nil
+    ) {
+        self.pollConfig = pollConfig
+        self.artifactStore = artifactStore
+        self.fileCache = fileCache
+        self.backgroundContinuation = backgroundContinuation ?? ScanBackgroundContinuation.shared
+        self.completionNotifier = completionNotifier ?? ScanCompletionNotifier()
+    }
+
+    func configure(scanRepository: ScanRepositoryProtocol) {
+        self.scanRepository = scanRepository
+        artifactStore.sweepOrphans()
+        resumeRestoredWork()
+    }
+
+    // MARK: - 조회 (UI가 읽는 것)
+
+    /// 실패 후 사용 가능한 재시도 여부.
+    /// 재시도 정보가 `.failed` 페이로드에 함께 있으므로 cross-house 오염은 구조적으로 불가능하다.
+    var canRetry: Bool {
+        guard case .failed(let failure) = activeScan?.phase else { return false }
+        return failure.retrySource != nil
+    }
+
+    // MARK: - 시동
+
+    /// 촬영 완료 후 호출. wrapUp → 압축 → 업로드 → 폴링 → 다운로드 전체 수행.
+    func startFullProcess(encoder: DatasetEncoder, houseId: Int) {
+        // 이전 스캔의 기록·zip이 남아 있으면 압축·업로드 중 앱 종료 시
+        // 재시작 복구가 다른 집의 예전 스캔을 되살린다
+        artifactStore.clear()
+        // 처리가 끝나면 완료 알림을 보내므로, 유저가 처리를 시작하는 시점에 권한을 묻는다
+        completionNotifier.requestAuthorization()
+        start(.full(encoder: encoder), houseId: houseId)
+    }
+
+    /// 실패 지점에 맞는 진입점부터 재시도.
+    /// 다시 실패하면 단계가 던진 실패를 디스패처가 `.failed(retrySource:)`로 재설정한다.
+    func retry() {
+        guard let activeScan,
+              case .failed(let failure) = activeScan.phase,
+              let source = failure.retrySource else { return }
+        start(source.entry, houseId: activeScan.houseId)
+    }
+
+    // MARK: - 캡처 데이터셋
+
+    /// 촬영용 데이터셋 디렉토리 발급 — 생성·청소 위치를 스토어 한 곳에서 관리한다
+    func makeDatasetDirectory() throws -> URL {
+        try artifactStore.makeDatasetDirectory()
+    }
+
+    /// 변환 없이 버려지는 데이터셋 삭제 (인코더 생성 실패 등 인코더가 없는 경우)
+    func discardDataset(_ url: URL) {
+        artifactStore.discardDataset(url)
+    }
+
+    /// 변환 없이 버리는 인코더 폐기 (다시 촬영·화면 이탈).
+    /// 인코더는 생성 즉시 rgb.mp4를 열어 두고(AVAssetWriter) 녹화 중이던 인코딩 Task가
+    /// 삭제 직후에도 폴더를 다시 만들며 쓰므로, `wrapUp()`으로 전부 닫은 뒤에 지워야 폴더가 되살아나지 않는다.
+    /// 삭제는 메인 밖(`removeDataset`)에서 수행한다.
+    func discard(_ encoder: DatasetEncoder) async {
+        await encoder.wrapUp()
+        await artifactStore.removeDataset(encoder.datasetDirectoryURL)
+    }
+
+    /// 스캔 완료 알림을 알림센터에서 지운다. 미리보기 진입처럼 알림이 역할을 다한 시점에 부른다
+    func clearCompletionNotification() {
+        completionNotifier.removeDelivered()
+    }
+
+    // MARK: - 종료
+
+    /// 진행 중인 스캔 취소. 서버 스캔이 있으면 취소 요청 Task를 돌려준다 —
+    /// 로그아웃처럼 요청 완료 후에 이어갈 작업(토큰 삭제)이 있으면 await해서 순서를 보장한다.
+    @discardableResult
+    func cancel() -> Task<Void, Never>? {
+        let scanId = activeScan?.scanId ?? 0
+        reset()
+
+        // 저장소를 직접 캡처한다 — 로그아웃 시 매니저가 DI 캐시에서 해제돼도 요청이 나가야 한다
+        guard scanId > 0, let scanRepository else { return nil }
+        return Task {
+            try? await scanRepository.cancelScan(scanId: scanId)
+        }
+    }
+
+    /// 완료된 스캔 소비 (저장 완료 후 호출)
+    func clear() {
+        reset()
+    }
+
+    #if DEBUG
+    /// 폴링 기록을 남기고 폴링 단계부터 시작 (재시작 복구 시뮬레이션)
+    func resumePolling(scanId: Int, houseId: Int) {
+        artifactStore.save(.polling(scanId: scanId, houseId: houseId))
+        start(.polling(scanId: scanId), houseId: houseId)
+    }
+
+    func setActiveScan(_ scan: ActiveScan?) {
+        activeScan = scan
+    }
+
+    var currentTask: Task<Void, Never>? { processingTask }
+    #endif
+
+    // MARK: - Stage Lifecycle
+
+    /// 진행 중인 Task를 취소하고 지정한 진입점부터 파이프라인을 실행한다.
+    /// 시작·재시도·복원이 전부 이 디스패처를 통과하고,
+    /// 단계가 던진 `ScanFailure`도 여기서만 `.failed`로 기록된다.
+    /// 재시도 불가 실패의 기록·zip 폐기도 여기서만 한다 — 재시도 가능 여부와 재시작 복구 여부가 항상 일치한다.
+    private func start(_ entry: PipelineEntry, houseId: Int) {
+        cancelProcessingTask()
+        activeScan = ActiveScan(scanId: entry.scanId, houseId: houseId, phase: entry.initialPhase)
+
+        // 백그라운드 연장은 유저가 시작한 처리(촬영 완료·업로드 재시도)에 요청해 프리뷰 완료까지 유지한다.
+        // 폴링·다운로드 진입점은 재시작 복원과 공유해 유저 동작인지 구분할 수 없으므로 대상에서 뺀다
+        let progress: Progress?
+        switch entry {
+        case .full:
+            progress = Progress.discreteProgress(totalUnitCount: 100)
+        case .upload:
+            // 압축이 이미 끝난 재시도라 그 몫을 채운 채 시작한다
+            let tracked = Progress.discreteProgress(totalUnitCount: 100)
+            tracked.completedUnitCount = ProgressShare.zip
+            progress = tracked
+        case .polling, .download:
+            progress = nil
+        }
+        if let progress {
+            let phase = entry.initialPhase
+            backgroundContinuation.begin(tracking: progress, title: phase.title, subtitle: phase.message)
+        }
+
+        processingTask = Task { [weak self] in
+            do {
+                switch entry {
+                case .full(let encoder):
+                    try await self?.fullProcess(encoder: encoder, houseId: houseId, progress: progress)
+                case .upload(let zipURL):
+                    try await self?.uploadThenPoll(zipURL: zipURL, houseId: houseId, progress: progress)
+                case .polling(let scanId):
+                    try await self?.pollAndDownload(scanId: scanId, progress: nil)
+                case .download(let scanId):
+                    try await self?.downloadPreview(scanId: scanId)
+                }
+            } catch let failure as ScanFailure {
+                // 취소된 Task의 늦은 실패가 정리·교체된 상태를 되살리지 않도록 한다
+                guard let self, !Task.isCancelled else { return }
+                let failedPhase = ProcessingPhase.failed(failure)
+                self.backgroundContinuation.update(title: failedPhase.title, subtitle: failedPhase.message)
+                self.backgroundContinuation.end(success: false)
+                if failure.retrySource == nil {
+                    self.artifactStore.clear()
+                }
+                // 단계 전환이 반영된 최신 scanId를 유지한다 (업로드 성공 후 폴링 실패 등)
+                self.activeScan = ActiveScan(
+                    scanId: self.activeScan?.scanId ?? entry.scanId,
+                    houseId: houseId,
+                    phase: failedPhase
+                )
+            } catch {
+                // CancellationError — 취소·교체로 죽는 Task는 상태를 건드리지 않고 조용히 끝난다
+            }
+        }
+    }
+
+    /// 진행 중인 Task를 취소하고 백그라운드 연장도 함께 끝낸다
+    private func cancelProcessingTask() {
+        processingTask?.cancel()
+        backgroundContinuation.end(success: false)
+    }
+
+    /// 취소·소비 공통 정리: Task 취소, 상태 제거, 기록·zip 폐기
+    private func reset() {
+        cancelProcessingTask()
+        activeScan = nil
+        artifactStore.clear()
+    }
+
+    /// 진행 중 단계 전환 — houseId는 유지하고 phase(필요 시 scanId)만 바꾼다.
+    /// 상태가 이미 정리됐다면(reset 경합) 죽은 스캔을 되살리지 않도록 건너뛴다.
+    private func advance(to phase: ProcessingPhase, scanId: Int? = nil) {
+        guard let current = activeScan else { return }
+        activeScan = ActiveScan(scanId: scanId ?? current.scanId, houseId: current.houseId, phase: phase)
+        backgroundContinuation.update(title: phase.title, subtitle: phase.message)
+    }
+
+    /// 백그라운드 연장 진행률 배분(전체 100). 남은 5는 프리뷰까지 받으면 채운다.
+    /// 서버 처리는 진행률을 알 수 없어 폴링 시도 예산을 쓴 만큼 채운다 — 진행이 멈춘 연장은 시스템이 먼저 끊는다
+    private enum ProgressShare {
+        static let zip: Int64 = 15
+        static let upload: Int64 = 25
+        static let polling: Int64 = 55
+    }
+
+    // MARK: - Restore
+
+    /// 앱 재시작 시 저장된 진행 단계 복원.
+    /// 폴링 기록은 재폴링으로, 업로드 미완 기록은 재시도 가능한 실패 상태로 되살린다.
+    private func resumeRestoredWork() {
+        switch artifactStore.restore() {
+        case .polling(let scanId, let houseId):
+            // 기록은 이미 있으므로 다시 저장하지 않고 폴링만 시작한다
+            start(.polling(scanId: scanId), houseId: houseId)
+        case .uploadRetry(let zipURL, let houseId):
+            // Task를 띄우지 않고 상태만 복원 — 기존 재시도 UI(ScanStatusSheet)가 그대로 작동한다
+            activeScan = ActiveScan(
+                scanId: 0, houseId: houseId,
+                phase: .failed(ScanFailure(userMessage: "업로드가 완료되지 않았습니다", retrySource: .upload(zipURL: zipURL)))
+            )
+        case nil:
+            break
+        }
+    }
+
+    // MARK: - Pipeline (실행 순서: fullProcess → uploadThenPoll → pollAndDownload → downloadPreview)
+    // 실패는 ScanFailure를 던져 디스패처가 기록하고, 취소는 CancellationError로 조용히 끝난다.
+
+    private func fullProcess(encoder: DatasetEncoder, houseId: Int, progress: Progress?) async throws {
+        // zip 완성 전에는 어떤 이유로 떠나든 데이터셋을 지워야 한다(재시도 경로가 없다) —
+        // 탈출 경로마다 개별 정리하지 않고 catch 한 곳이 불변식을 지킨다
+        let datasetDir = encoder.datasetDirectoryURL
+        let zipURL = artifactStore.zipDestinationURL()
+        let zipProgress = progress.map { Progress(totalUnitCount: 0, parent: $0, pendingUnitCount: ProgressShare.zip) }
+        do {
+            _ = try repository()
+
+            // 1. WrapUp — 인코딩 실패한 데이터셋은 서버에서도 처리에 실패하므로 압축 전에 끝낸다
+            await encoder.wrapUp()
+            guard encoder.status == .allGood else {
+                throw ScanFailure(userMessage: "스캔 데이터 저장에 실패했습니다. 다시 촬영해 주세요", retrySource: nil)
+            }
+            try Task.checkCancellation()
+
+            // 2. Zip — 대용량 데이터셋의 동기 압축이라 메인 스레드에서 수행하면 UI가 멈춘다.
+            // 생성 위치는 영속 디렉토리 — tmp는 앱 종료 시 OS가 청소할 수 있어 재시작 복구가 불가능하다
+            try await Task.detached(priority: .userInitiated) {
+                try FileManager.default.zipItem(at: datasetDir, to: zipURL, shouldKeepParent: false, progress: zipProgress)
+            }.value
+            try Task.checkCancellation()
+        } catch {
+            // 구성 실패·취소·압축 실패 공통: 파편과 대용량 데이터셋을 즉시 정리한다.
+            // 데이터셋은 파일이 수천 개라 메인에서 동기로 지우면 UI가 멈추므로 백그라운드 경로를 쓴다
+            artifactStore.discard(zipURL)
+            await artifactStore.removeDataset(datasetDir)
+            if error is CancellationError || error is ScanFailure { throw error }
+            #if DEBUG
+            print("[ScanProcessing] 압축 실패: \(error)")
+            #endif
+            throw ScanFailure(userMessage: "스캔 데이터 압축에 실패했습니다", retrySource: nil)
+        }
+
+        // zip 완성 — 여기서부터는 앱이 죽어도 업로드 재시도로 복구할 수 있다.
+        // 재시도·복구는 zip만 쓰므로 원본 데이터셋은 바로 지워 디스크 이중 점유를 없앤다
+        artifactStore.save(.uploadReady(zipFileName: zipURL.lastPathComponent, houseId: houseId))
+        await artifactStore.removeDataset(datasetDir)
+        // 삭제 중 취소됐다면 업로드로 넘어가지 않는다 — 기록·zip 폐기는 취소 주체(reset)가 맡는다
+        try Task.checkCancellation()
+
+        // 3. 업로드부터는 재시도 경로와 공유한다
+        advance(to: .uploading)
+        try await uploadThenPoll(zipURL: zipURL, houseId: houseId, progress: progress)
+    }
+
+    /// zip 업로드 후 폴링 단계로 이어간다. 최초 업로드와 재시도 공용 경로.
+    private func uploadThenPoll(zipURL: URL, houseId: Int, progress: Progress?) async throws {
+        let scanRepository = try repository()
+        let uploadProgress = progress.map { Progress(totalUnitCount: 0, parent: $0, pendingUnitCount: ProgressShare.upload) }
+        let scanResult: ScanResult
+        do {
+            scanResult = try await scanRepository.uploadScan(houseId: houseId, fileURL: zipURL, progress: uploadProgress)
+        } catch {
+            // 기록된 zip은 취소 주체(reset·startFullProcess)가 스토어로 폐기한다
+            if Task.isCancelled { throw CancellationError() }
+            // 재시도 가능하면 zip과 uploadReady 기록이 이미 영속 상태라 보존을 위해 할 일이 없고,
+            // 불가하면 디스패처가 기록·zip을 폐기한다
+            throw ScanFailure(
+                userMessage: "업로드 실패: \(error.userMessage)",
+                retrySource: error.isRetryable ? .upload(zipURL: zipURL) : nil
+            )
+        }
+        // 취소됐다면 기록을 전환하지 않는다 — cancel()의 reset이 이미 기록·zip을 폐기했다
+        try Task.checkCancellation()
+
+        // 업로드 성공 — 단계를 폴링으로 원자 전환하고 다 쓴 zip을 지운다
+        let scanId = scanResult.scanId
+        artifactStore.markUploaded(scanId: scanId, houseId: houseId)
+        advance(to: .polling, scanId: scanId)
+        try await pollAndDownload(scanId: scanId, progress: progress)
+    }
+
+    private func pollAndDownload(scanId: Int, progress: Progress?) async throws {
+        let scanRepository = try repository()
+        let pollProgress = progress.map {
+            Progress(totalUnitCount: Int64(pollConfig.maxAttempts), parent: $0, pendingUnitCount: ProgressShare.polling)
+        }
+
+        // COMPLETED가 나올 때까지 폴링
+        var attempts = 0
+        var consecutiveErrors = 0
+        while true {
+            try Task.checkCancellation()
+
+            attempts += 1
+            if attempts > pollConfig.maxAttempts {
+                // 서버 스캔은 파괴하지 않는다 — cancelScan은 유저의 명시적 취소에서만.
+                // 진행 기록을 유지해 재시도(재폴링)와 앱 재시작 복구가 가능하게 한다
+                throw ScanFailure(userMessage: "처리 시간이 초과되었습니다", retrySource: .polling(scanId: scanId))
+            }
+            pollProgress?.completedUnitCount = Int64(attempts)
+
+            do {
+                let status = try await scanRepository.getScanStatus(scanId: scanId).uppercased()
+                // 취소 후 늦게 도착한 응답이 다운로드로 진행하지 않도록 한다
+                try Task.checkCancellation()
+                consecutiveErrors = 0
+                #if DEBUG
+                print("[ScanProcessing] scanId=\(scanId) status=\(status)")
+                #endif
+                if status == "COMPLETED" { break }
+                if status == "FAILED" {
+                    throw ScanFailure(userMessage: "서버에서 스캔 처리에 실패했습니다", retrySource: nil)
+                }
+            } catch let error as RepositoryError {
+                try Task.checkCancellation()
+                consecutiveErrors += 1
+                #if DEBUG
+                print("[ScanProcessing] scanId=\(scanId) 상태 조회 실패(\(consecutiveErrors)/\(pollConfig.maxConsecutiveErrors)): \(error)")
+                #endif
+                if consecutiveErrors >= pollConfig.maxConsecutiveErrors {
+                    // 일시적 네트워크 문제일 수 있는 비확정 실패 — 재시도 가능하면 진행 기록을 유지해
+                    // 재시도(재폴링)와 앱 재시작 복구가 가능하게 한다. 재시도 불가(4xx 등)면 디스패처가 기록을 폐기한다
+                    throw ScanFailure(
+                        userMessage: "상태 조회 실패: \(error.userMessage)",
+                        retrySource: error.isRetryable ? .polling(scanId: scanId) : nil
+                    )
+                }
+            }
+            try? await Task.sleep(for: pollConfig.interval)
+        }
+
+        try await downloadPreview(scanId: scanId)
+    }
+
+    /// 프리뷰 다운로드. 폴링에서 COMPLETED를 확인한 뒤에만 호출된다.
+    /// 재시도 가능한 실패는 서버 처리가 이미 완료이므로 기록을 유지한다 —
+    /// 앱 재시작 시 폴링 재개 → COMPLETED 즉시 확인 → 재다운로드로 자연 복구된다.
+    private func downloadPreview(scanId: Int) async throws {
+        let scanRepository = try repository()
+        do {
+            let fileURLString = try await scanRepository.getScanPreview(scanId: scanId)
+            try Task.checkCancellation()
+            guard let remoteURL = URL(string: fileURLString) else {
+                throw ScanFailure(userMessage: "잘못된 파일 URL", retrySource: nil)
+            }
+            let localURL = try await fileCache.download(from: remoteURL, roomId: scanId)
+            // 취소 후 완료된 다운로드(캐시 히트 등)가 취소된 스캔을 .completed로 되살리지 않도록 한다
+            try Task.checkCancellation()
+            let completed = ProcessingPhase.completed(fileURL: localURL)
+            advance(to: completed)
+            backgroundContinuation.end(success: true)
+            if let houseId = activeScan?.houseId {
+                completionNotifier.notify(title: completed.title, body: completed.message, houseId: houseId)
+            }
+        } catch let failure as ScanFailure {
+            throw failure
+        } catch {
+            // 취소로 끊긴 요청을 실패로 기록하지 않는다
+            try Task.checkCancellation()
+            // fileCache.download는 typed throws 경계 밖(URLSession)이라 여기서 정규화한다
+            let repositoryError = RepositoryError.normalize(error)
+            throw ScanFailure(
+                userMessage: "프리뷰 다운로드 실패: \(repositoryError.userMessage)",
+                retrySource: repositoryError.isRetryable ? .download(scanId: scanId) : nil
+            )
+        }
+    }
+
+    /// configure 전에는 파이프라인을 돌릴 수 없다 — 조용히 끝나면 상태가 진행 단계에 멈추므로 실패로 던진다
+    private func repository() throws -> ScanRepositoryProtocol {
+        guard let scanRepository else {
+            throw ScanFailure(userMessage: "스캔 서비스를 사용할 수 없습니다", retrySource: nil)
+        }
+        return scanRepository
+    }
+}

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "roomlog-ai"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic-settings",
+    "httpx",
+    "openai",
+    "open3d",
+    "opencv-python-headless",
+    "scipy",
+    "numpy",
+    "Pillow",
+    "trimesh",
+    "usd-core",
+    "scikit-video",
+    "python-multipart",
+    "redis[asyncio]",
+    "boto3",
+    "fal-client",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]

@@ -1,0 +1,120 @@
+//
+//  USDZFileCache.swift
+//  RoomLog
+//
+//  Created by 김도연 on 5/12/26.
+//
+
+import Foundation
+
+actor USDZFileCache {
+
+    static let shared = USDZFileCache()
+
+    private let fileManager = FileManager.default
+    private let cacheDirectory: URL
+
+    /// 테스트에서 임시 디렉터리를 주입할 수 있게 한다. nil이면 기존 Caches/USDZFiles 경로.
+    /// (`??`의 우변은 autoclosure라 actor init에서 `fileManager`를 잡으면 격리 경고가 나므로 분기로 쓴다)
+    init(cacheDirectory: URL? = nil) {
+        if let cacheDirectory {
+            self.cacheDirectory = cacheDirectory
+        } else {
+            let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            self.cacheDirectory = caches.appendingPathComponent("USDZFiles", isDirectory: true)
+            // PLY 시절 캐시(Caches/PLYFiles)는 더 이상 읽지 않으므로 남아 있으면 정리한다
+            try? fileManager.removeItem(at: caches.appendingPathComponent("PLYFiles", isDirectory: true))
+        }
+    }
+
+    // MARK: - Public
+
+    /// 캐시된 파일 경로 반환. 없으면 nil.
+    func cachedFileURL(for roomId: Int) -> URL? {
+        let url = fileURL(for: roomId)
+        return fileManager.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// 서버 URL에서 .usdz 파일 다운로드 후 캐시. remoteURL이 이전에 캐시된 것과 같으면 재사용, 다르면 재다운로드.
+    func download(from remoteURL: URL, roomId: Int) async throws -> URL {
+        let destination = fileURL(for: roomId)
+        if fileManager.fileExists(atPath: destination.path),
+           cachedSourceURLString(for: roomId) == remoteURL.absoluteString {
+            return destination
+        }
+
+        let (tempURL, response) = try await URLSession.shared.download(from: remoteURL)
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode) {
+            try? FileManager.default.removeItem(at: tempURL)
+            throw URLError(.badServerResponse)
+        }
+
+        try ensureCacheDirectory()
+
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
+        }
+        try fileManager.moveItem(at: tempURL, to: destination)
+        do {
+            try remoteURL.absoluteString.write(to: sourceURLFile(for: roomId), atomically: true, encoding: .utf8)
+        } catch {
+            try? fileManager.removeItem(at: destination)
+            try? fileManager.removeItem(at: sourceURLFile(for: roomId))
+            throw error
+        }
+
+        return destination
+    }
+
+    /// 특정 방의 캐시 삭제
+    func removeCache(for roomId: Int) {
+        try? fileManager.removeItem(at: fileURL(for: roomId))
+        try? fileManager.removeItem(at: sourceURLFile(for: roomId))
+    }
+
+    /// 임시 키(oldRoomId, 예: scanId)로 캐시된 파일을 새 roomId로 이전. 재다운로드 없이 그대로 재사용하기 위함.
+    /// .usdz/.source 쌍이 온전할 때만 이전하며, 한쪽이라도 실패하면 대상 쌍을 제거해 다음 호출이 재다운로드하도록 한다.
+    func rekey(from oldRoomId: Int, to newRoomId: Int) {
+        guard oldRoomId != newRoomId else { return }
+
+        let oldFile = fileURL(for: oldRoomId)
+        let oldSource = sourceURLFile(for: oldRoomId)
+        guard fileManager.fileExists(atPath: oldFile.path),
+              fileManager.fileExists(atPath: oldSource.path) else { return }
+
+        let newFile = fileURL(for: newRoomId)
+        let newSource = sourceURLFile(for: newRoomId)
+        try? fileManager.removeItem(at: newFile)
+        try? fileManager.removeItem(at: newSource)
+
+        do {
+            try fileManager.moveItem(at: oldFile, to: newFile)
+            try fileManager.moveItem(at: oldSource, to: newSource)
+        } catch {
+            try? fileManager.removeItem(at: newFile)
+            try? fileManager.removeItem(at: newSource)
+        }
+    }
+
+    // MARK: - Private
+
+    private func fileURL(for roomId: Int) -> URL {
+        cacheDirectory.appendingPathComponent("room_\(roomId).usdz")
+    }
+
+    /// 캐시된 파일이 어느 원격 URL에서 받아온 것인지 기록해두는 사이드카 파일 (캐시 무효화 판단용)
+    private func sourceURLFile(for roomId: Int) -> URL {
+        cacheDirectory.appendingPathComponent("room_\(roomId).source")
+    }
+
+    private func cachedSourceURLString(for roomId: Int) -> String? {
+        try? String(contentsOf: sourceURLFile(for: roomId), encoding: .utf8)
+    }
+
+    private func ensureCacheDirectory() throws {
+        if !fileManager.fileExists(atPath: cacheDirectory.path) {
+            try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        }
+    }
+}

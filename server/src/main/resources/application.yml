@@ -1,0 +1,37 @@
+spring:
+  datasource:
+    hikari:
+      max-lifetime: 540000
+      keepalive-time: 300000
+      connection-timeout: 30000
+  servlet:
+    multipart:
+      max-file-size: 500MB
+      max-request-size: 500MB
+
+springdoc:
+  swagger-ui:
+    tags-sorter: alpha
+
+server:
+  port: ${PORT:8080}
+
+jwt:
+  secret: ${JWT_SECRET}
+  expiration: 86400000
+  refresh-expiration: 1209600000
+
+ai:
+  api-key: ${AI_API_KEY}
+  server-url: ${AI_SERVER_URL}
+  callback-base-url: ${AI_CALLBACK_BASE_URL:http://localhost:8080}
+
+kakao:
+  api-key: ${KAKAO_API_KEY}
+
+gpt:
+  api-key: ${GPT_API_KEY}
+  model: ${GPT_MODEL:gpt-4o-mini}
+
+youtube:
+  api-key: ${YOUTUBE_API_KEY}

@@ -1,0 +1,109 @@
+//
+//  SignUpView.swift
+//  RoomLog
+//
+//  Created by 김도연 on 4/30/26.
+//
+
+import SwiftUI
+
+struct SignUpView: View {
+    @Environment(\.di) var di: DIContainer
+    @Environment(\.dismiss) var dismiss
+    @State private var viewModel: SignUpViewModel?
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                titleSection
+                if let viewModel {
+                    inputFields(viewModel)
+                    signUpButton(viewModel)
+                }
+            }
+        }
+        .defaultScrollAnchor(.center, for: .alignment)
+        .scrollBounceBehavior(.basedOnSize)
+        .onAppear {
+            if viewModel == nil {
+                let provider = di.resolve(AuthUseCaseProvider.self)
+                viewModel = SignUpViewModel(signUpUseCase: provider.signUpUseCase)
+            }
+        }
+        .onChange(of: viewModel?.isSignUpCompleted) { _, newValue in
+            if newValue == true {
+                dismiss()
+            }
+        }
+    }
+}
+
+// MARK: - Subviews
+private extension SignUpView {
+
+    var titleSection: some View {
+        Text("회원가입")
+            .font(.bold, 24)
+            .foregroundStyle(.neutral900)
+            .padding(.bottom, 32)
+    }
+
+    func inputFields(_ viewModel: SignUpViewModel) -> some View {
+        VStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 6) {
+                TextField("이메일", text: Bindable(viewModel).email)
+                    .textContentType(.emailAddress)
+                    .keyboardType(.emailAddress)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                    .padding(.vertical, 16)
+                    .padding(.horizontal, 20)
+                    .background(.neutral50, in: Capsule())
+                    .font(.medium, 16)
+
+                // 형식 오류·중복 이메일은 해당 필드 아래에서 바로 안내한다
+                if let emailError = viewModel.emailError {
+                    InlineErrorText(message: emailError)
+                }
+            }
+
+            SecureField("비밀번호", text: Bindable(viewModel).password)
+                .textContentType(.newPassword)
+                .padding(.vertical, 16)
+                .padding(.horizontal, 20)
+                .background(.neutral50, in: Capsule())
+                .font(.medium, 16)
+
+            TextField("닉네임", text: Bindable(viewModel).nickname)
+                .autocapitalization(.none)
+                .disableAutocorrection(true)
+                .padding(.vertical, 16)
+                .padding(.horizontal, 20)
+                .background(.neutral50, in: Capsule())
+                .font(.medium, 16)
+
+            if let errorMessage = viewModel.errorMessage {
+                InlineErrorText(message: errorMessage)
+            }
+        }
+        // CTA 버튼의 좌우 여백(16)과 폭을 맞춘다
+        .padding(.horizontal, 16)
+    }
+
+    func signUpButton(_ viewModel: SignUpViewModel) -> some View {
+        BottomCTAButton {
+            Task { await viewModel.signUp() }
+        } label: {
+            if viewModel.isLoading {
+                ProgressView()
+                    .tint(.white)
+            } else {
+                Text("회원가입")
+                    .font(.semibold, 16)
+            }
+        }
+        // 입력이 비어 있으면 눌러도 에러 문구만 뜨므로 처음부터 비활성화한다
+        .disabled(viewModel.isLoading || !viewModel.canSubmit)
+        .padding(.top, 24)
+    }
+}
